@@ -4,76 +4,70 @@ import requests
 import time
 import tensorflow as tf
 
-# 💡 이제 h5 파일 대신 tflite 파일을 씁니다.
-MODEL_PATH = "model.tflite"  
-LABELS_PATH = "labels.txt"  
-BLYNK_AUTH = "hNvupXmIFZOKH4yEb4foPus56NKG1JpP" 
+# [설정]
+BLYNK_AUTH = "hNvupXmIFZOKH4yEb4foPus56NKG1JpP"
 SECRET_PASSWORD = ["Pose1", "Pose2", "Pose3"]
+MODEL = tf.lite.Interpreter(model_path="model.tflite")
+MODEL.allocate_tensors()
+LABELS = [line.strip().split()[-1] for line in open("labels.txt", "r")]
 
-def send_to_blynk(value):
-    # 서버 주소를 더 범용적인 blynk.cloud로 수정
-    url = f"https://blynk.cloud/external/api/update?token={BLYNK_AUTH}&V4={value}"
+def control_safe(action):
+    """Blynk 서버로 금고 열림(1) 또는 닫힘(0) 명령 전송"""
+    url = f"https://blynk.cloud/external/api/update?token={BLYNK_AUTH}&V4={action}"
     try:
-        # 3초 동안 응답이 없으면 포기하도록 설정
-        response = requests.get(url, timeout=3)
-        print(f"📡 서버 응답 코드: {response.status_code}") 
-        if response.status_code == 200:
-            print(f"✅ [성공] Blynk 서버로 {value} 신호 전송 완료!")
-        else:
-            print(f"⚠️ [주의] 서버 응답이 이상합니다: {response.status_code}")
+        requests.get(url, timeout=3)
+        print(f"✅ 서버 명령 성공: {action}")
     except Exception as e:
-        print(f"❌ [전송 에러 발생] : {e}")
-        print("💡 팁: 지금 컴퓨터가 인터넷에 연결되어 있는지, 혹은 방화벽(학교/회사)에 막혀있지 않은지 확인하세요!")
+        print(f"❌ 전송 실패: {e}")
 
-# TFLite 모델 로드
-interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
-interpreter.allocate_tensors()
-input_details = interpreter.get_input_details()
-output_details = interpreter.get_output_details()
-class_names = [line.strip() for line in open(LABELS_PATH, "r").readlines()]
-
+# [초기화]
 camera = cv2.VideoCapture(0)
-current_sequence = []
-last_detected_pose = "Idle"
-safe_opened = False  
+input_idx = MODEL.get_input_details()[0]['index']
+output_idx = MODEL.get_output_details()[0]['index']
+seq = []
+last_pose = ""
 
-print("🔒 AI 금고 가동 중... (ESC로 종료)")
+print("🔒 AI 금고 시작!")
 
 while True:
-    ret, image = camera.read()
+    ret, frame = camera.read()
     if not ret: break
 
-    img_data = cv2.resize(image, (224, 224))
-    img_data = np.expand_dims(img_data, axis=0).astype(np.float32) / 127.5 - 1
+    # 1. 이미지 전처리
+    img = cv2.resize(frame, (224, 224))
+    img = np.expand_dims(img.astype(np.float32) / 127.5 - 1, axis=0)
     
-    interpreter.set_tensor(input_details[0]['index'], img_data)
-    interpreter.invoke()
-    prediction = interpreter.get_tensor(output_details[0]['index'])[0]
+    # 2. AI 예측
+    MODEL.set_tensor(input_idx, img)
+    MODEL.invoke()
+    pred = MODEL.get_tensor(output_idx)[0]
+    
+    idx = np.argmax(pred)
+    pose = "".join([c for c in LABELS[idx] if c.isalpha() or c.isdigit()])
+    conf = pred[idx]
 
-    index = np.argmax(prediction)
-    # 💡 라벨명에서 숫자/공백 제거 (예: "2 Pose2" -> "Pose2")
-    class_name = "".join([c for c in class_names[index].split()[-1] if c.isalpha() or c.isdigit()])
-    confidence = prediction[index]
+    # 3. 로직 처리 (정확도 80% 이상 & 새로운 포즈일 때)
+    if conf > 0.8 and pose != last_pose and pose != "Idle":
+        print(f"🎵 감지: {pose}")
+        
+        # 비밀번호 시퀀스 검사
+        if pose in SECRET_PASSWORD:
+            if pose == SECRET_PASSWORD[len(seq)]:
+                seq.append(pose)
+                if seq == SECRET_PASSWORD:
+                    control_safe(1)
+                    seq = [] # 초기화
+            else:
+                seq = [] # 틀리면 초기화
+        
+        # 닫기 포즈 인식 시
+        elif pose == "close":
+            control_safe(0)
+            
+        last_pose = pose
+        time.sleep(0.5)
 
-    if confidence > 0.8:
-        if class_name != last_detected_pose and class_name != "Idle":
-            print(f"🎵 감지됨: {class_name}")
-            if not safe_opened and class_name in SECRET_PASSWORD:
-                if class_name == SECRET_PASSWORD[len(current_sequence)]:
-                    current_sequence.append(class_name)
-                    if current_sequence == SECRET_PASSWORD:
-                        send_to_blynk(1)
-                        safe_opened = True
-                        current_sequence = []
-                else:
-                    current_sequence = []
-            elif safe_opened and class_name == "close":
-                send_to_blynk(0)
-                safe_opened = False
-            last_detected_pose = class_name
-            time.sleep(0.5)
-
-    cv2.imshow("Webcam", image)
+    cv2.imshow("Webcam", frame)
     if cv2.waitKey(1) == 27: break
 
 camera.release()
